@@ -19,7 +19,7 @@ var sys 	= require('sys'),
 
 
 var emitter = new events.EventEmitter();
-var __HOST__ = 'trdatadev.com'; //основный хост   ===========> МЕНЯТЬ ХОСТ ЗДЕСЬ! 
+var __HOST__ = 'opentradeengine.com'; //test
 var __STARTUP__ = new Date().getTime(); // время запуска сервера 
 
 //сведенья о последней ошибке 
@@ -41,11 +41,11 @@ var options = {
 	//конфиг для Flash socket server 
 	encoding : 'utf8',
 	port: 443,
-	host : 'push2.' + __HOST__,
+	host : 'exchange.' + __HOST__,
 	
 	//RedisDB server 
 	redisPort: 6379,
-	redisHost: 'scylla.trdata.com',
+	redisHost: 'localhost',
 	
 	//второй сервер, если есть
 	slavePort: 6380,
