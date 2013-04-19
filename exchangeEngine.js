@@ -1,17 +1,16 @@
 ﻿/**  metaExchange Engine **/
 
-var 	sys 	= require('sys'),
-    	net	= require('net'),
+var sys 	= require('sys'),
+    net		= require('net'),
 	events  = require("events"),
 	eye 	= require('./lib/eyes'),
 	crypto 	= require('crypto'),
 	RJSON   = require('./lib/rjson'),
-	redis   = require("./lib/node_redis2/index"),
-	async   = require('./lib/async'),
-	Buffer 	= require('buffer').Buffer,	
-	_ 	= require('./lib/underscore');
+	redis   = require("./lib/node_redis3/index"),
+	async   = require('./lib/async'),	
+	Buffer 	= require('buffer').Buffer;
 	
-	_.mixin(require('./lib/underscore.string'));
+var _ = require('./lib/underscore');
 
 
 
@@ -30,7 +29,9 @@ emitter.addListener('error', function(exc){
 });
 
 sys.puts('\n\n');
-sys.log(' ====== metaQuote Exchange Engine 0.1 at ' + __HOST__ + ' (Test) ======= ');
+sys.puts(' ====== openFxMarket.com ====== \n');
+sys.puts(' ====== 2013 (c) AGPsource.com ====== \n');
+sys.puts(' ====== metaQuote Exchange Engine 0.1 at ' + __HOST__ + ' (Test) ======= ');
 sys.puts('\n\n');
 
 // общий обьект настроек сервера
@@ -41,28 +42,29 @@ var options = {
 	host : 'exchange.' + __HOST__,
 	
 	//RedisDB server 
-	redisPort: 6379,
+	redisPort: 6380,
 	redisHost: 'localhost',
-	
-	//второй сервер, если есть
-	slavePort: 6380,
-	slaveHost: 'localhost',
-	
-	//список инструментов, которые торгуем (или автоматически)
-	tradeAssets: [], 
-	
+	redisConfig: {
+		parser: "javascript", //использовать hiredis, если есть возможность собрать и подключить 
+		//Setting this option to false can result in additional throughput at the cost of more latency.
+		socket_nodelay: true, 
+		enable_offline_queue: true
+	},
+		
 	//канал в редисе Pub/Sub для поступающих котировок 
 	redisOrdersStream: 'MQE_ORDERS_CHANNEL', 
 	//управляющий канал (команды, отмены и т.п.)
 	redisControlsStream: 'MQE_CONTROLS_CHANNEL',
-	//канал для процессинга ордеров - сюда идут ордера, которые можно матчить 
-	redisMatchedOrdersStream: 'MQE_MATCHED_ORDERS_CHANNELS',
+	//это список ордеров, которые сматчили, но они по какой-то причине не дошли до расчета по аккаунтам  
+	redisMatchedOrdersQueue: 'MQE_MATCHED_ORDERS',
 	//префикс для ордербуков (добавляем код инструмента в верхнем регистре)
 	redisOrderbookPrefix: 'MQE_ORDERBOOK_',
 	//название ключа для топовой котировки (хеш со всеми последними котировками (топ-оф-бук)
 	redisCurrentQuoteHash: 'MQE_LAST_QUOTES',
 	//канал, куда паблишим ордера, которые удачно добавлены в очереди
-	redisAcceptedOrdersStream: 'MQE_ACCEPTER_ORDERS_CHANNEL',
+	redisAcceptedOrdersStream: 'MQE_ACCEPTED_ORDERS_CHANNEL',
+	//для случая, когда отваливается слушатель списка подтвержденных ордеров 
+	redisAcceptedOrdersQueue: 'MQE_ACCEPTED_ORDERS',
 	//канал, куда сообщаем ид ордеров, которые не прошли 
 	redisErroredOrdersStream: 'MQE_ERRORED_ORDERS_CHANNEL',
 	//сет для ордеров, которые выбрали для матча, но еще не обработали 
@@ -113,7 +115,20 @@ var options = {
 			
 			avalaibleOrderTypes:['L','M'], //какие типы ордеров разрешены (L - limit, M - market)
 			price_code: 'USD', //код инструмента, в котором выражена цена 
-			asset_code: 'BTC' // код инструмента, который торгуется (на который заключены контракты)
+			asset_code: 'BTC', // код инструмента, который торгуется (на который заключены контракты)
+			
+			price_min: 0.001, //минимальная цена и минимальный шаг цен 
+			asset_min: 0.001, //минимальный размер лота
+			
+			//это максимальные цены и обьемы 
+			price_max: 99999,
+			asset_max: 99999,			
+			
+			//коммисия, которая взымается с операции (всегда берется от цены инструмента)
+			tax: {
+				sell: 0.001, //коммисия с продажи 
+				buy:  0.001  // коммисия с покупки
+			}			
 		}	
 	],
 	
@@ -124,9 +139,6 @@ var options = {
 	
 	
 };
-
-//список инструментов, по которых сейчас идут торги 
-var currentOpenTrades = ['BTC/USD'];
 
 //исключение, которое нигде не было перехвачено ранее
 process.addListener('uncaughtException', function (err){
@@ -141,26 +153,17 @@ process.addListener('uncaughtException', function (err){
   return true;  
 });
 
-//If you want to rotate logs, this will re-open the files on sighup
-process.addListener("SIGHUP", function(){
-  //log.reopen();
- // log_ban.reopen();
-  sys.log('Logfile are reopened for SIGHUP signal');
-});
-
 	redis.debug_mode = false;
 	
 	//это выделенное подключение для Pub/Sub
-	var pubsub = redis.createClient(options.redisPort, options.redisHost, {
-		parser: "javascript"
-	});
+	var pubsub = redis.createClient(options.redisPort, options.redisHost, options.redisConfig);
 	
 	pubsub.on("error", function (err){
 		sys.log("[ERROR] Redis error " + err);
 	});
 	
 	pubsub.on("connect", function (err){
-		sys.log('[OK] Connected to Redis-server at options.redisHost');
+		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 		
 		pubsub.subscribe([options.redisOrdersStream, options.redisControlsStream]);
 	});
@@ -168,7 +171,7 @@ process.addListener("SIGHUP", function(){
 	//слушаем каналы 
 	pubsub.on("message", function(ch, msg){
 		if (_.isEmpty(msg)) return;
-		
+	
 		try 
 		{
 			if (((ch == options.redisOrdersStream) || (ch == options.redisControlsStream)) && (msg.indexOf('{"_":') === 0))
@@ -204,99 +207,29 @@ process.addListener("SIGHUP", function(){
 	
 
 	//а теперь клиент для ордербуков 
-	var ordbs = redis.createClient(options.redisPort, options.redisHost, {
-		parser: "javascript"
-	});
+	var ordbs = redis.createClient(options.redisPort, options.redisHost, options.redisConfig);
 	
 	ordbs.on("error", function (err){
 		sys.log("[ERROR] Redis error " + err);
 	});
 	
 	ordbs.on("connect", function (err){
-		ordbs.select(2);
 		
+		//ordbs.select(2);
+		/*
 		ordbs.info(function(err, data){
 			sys.puts( '\n' + sys.inspect( data ) + '\n');
 		});
+		*/
 		
-		sys.log('[OK] Connected to Redis-server at options.redisHost');
+		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 	});
 	
-
-
-function str_replace (search, replace, subject, count) {
-  // http://kevin.vanzonneveld.net
-  // +   original by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
-  // +   improved by: Gabriel Paderni
-  // +   improved by: Philip Peterson
-  // +   improved by: Simon Willison (http://simonwillison.net)
-  // +    revised by: Jonas Raoni Soares Silva (http://www.jsfromhell.com)
-  // +   bugfixed by: Anton Ongson
-  // +      input by: Onno Marsman
-  // +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
-  // +    tweaked by: Onno Marsman
-  // +      input by: Brett Zamir (http://brett-zamir.me)
-  // +   bugfixed by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
-  // +   input by: Oleg Eremeev
-  // +   improved by: Brett Zamir (http://brett-zamir.me)
-  // +   bugfixed by: Oleg Eremeev
-  // %          note 1: The count parameter must be passed as a string in order
-  // %          note 1:  to find a global variable in which the result will be given
-  // *     example 1: str_replace(' ', '.', 'Kevin van Zonneveld');
-  // *     returns 1: 'Kevin.van.Zonneveld'
-  // *     example 2: str_replace(['{name}', 'l'], ['hello', 'm'], '{name}, lars');
-  // *     returns 2: 'hemmo, mars'
-  var i = 0,
-    j = 0,
-    temp = '',
-    repl = '',
-    sl = 0,
-    fl = 0,
-    f = [].concat(search),
-    r = [].concat(replace),
-    s = subject,
-    ra = Object.prototype.toString.call(r) === '[object Array]',
-    sa = Object.prototype.toString.call(s) === '[object Array]';
-  s = [].concat(s);
-  if (count) {
-    this.window[count] = 0;
-  }
-
-  for (i = 0, sl = s.length; i < sl; i++) {
-    if (s[i] === '') {
-      continue;
-    }
-    for (j = 0, fl = f.length; j < fl; j++) {
-      temp = s[i] + '';
-      repl = ra ? (r[j] !== undefined ? r[j] : '') : r[0];
-      s[i] = (temp).split(f[j]).join(repl);
-      if (count && s[i] !== temp) {
-        this.window[count] += (temp.length - s[i].length) / f[j].length;
-      }
-    }
-  }
-  return sa ? s : s[0];
-}
-
 //=================
 //обработка  
 emitter.addListener('MQE_newOrder', function(data){
-	//по сути, нам ничего особо не нужно - добавить только в ордербук котировку и потом инициировать обновление топов
-	
-	//надо проверить, разрешены ли торги по инструменту 
-	if (!_.inArray(data.a, currentOpenTrades))
-	{
-		options.lastErroredOrderIds.push( data._ );
-		
-		//запишем текст ошибки 
-		data.__error = 'Error, trade unavalaible';
-				
-		//оповестим других про ошибочный ордер 
-		ordbs.publish(options.redisErroredOrdersStream, data);	
-		
-		return;
-	}	
-	
+	//по сути, нам ничего особо не нужно - добавить только в ордербук котировку
+
 	ordbs.zadd([ 
 				//вида: MQE_ORDERBOOK_BTC/USD_S (sell) или MQE_ORDERBOOK_BTC/USD_B (buy)
 				options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(), //это куда писать 
@@ -304,26 +237,32 @@ emitter.addListener('MQE_newOrder', function(data){
 				data.__json				
 				], 
 				function(err, response){
-				
-			if (!err)
-			{
-				//добавили? вышлем подтверждение 
-				ordbs.publish(options.redisAcceptedOrdersStream, data._);
-			}
-			else
-			{
-				options.lastErroredOrderIds.push( data._ );
-				//запишем текст ошибки 
-				data.__error = response;
-				
-				//оповестим других про ошибочный ордер 
-				ordbs.publish(options.redisErroredOrdersStream, data);			
-			}
-	});	
+					if (!err)
+					{
+						//добавили? вышлем подтверждение, что мы приняли ордер  
+						ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, data){
+							//но, если там никто не слушает? 
+							if ((err) && (data < 1))
+							{
+								ordbs.rpush(options.redisAcceptedOrdersQueue, data._);
+							}
+						});
+					}
+					else
+					{
+						sys.puts( eye.inspect( data ) );
+						sys.puts( eye.inspect( [err, response] ) );
+						
+						options.lastErroredOrderIds.push( data._ );
+						//запишем текст ошибки 
+						data.__error = response;
+						
+						//оповестим других про ошибочный ордер 
+						ordbs.publish(options.redisErroredOrdersStream, data);			
+					}
+				}
+	);	
 });
-
-
-
 
 //собственно, сам матчинг енжайн 
 emitter.addListener('MQE_matchEngine', function(a, sell, buy){
@@ -614,7 +553,7 @@ sys.log('[Matched] SELL market matched  => ' + 	_best_buy.p + '/' + sell.v);
 	);	
 });
 
-var _lastMatchesTime = [];
+var _lastMatchesTime = []; //счетчик среднего матчинга 
 //этот метод матчит две котировки конкретные
 emitter.addListener('MQE_matchOrder', function(sell, buy){
 	//match! 
@@ -673,22 +612,48 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 		function(callBack){
 			//теперь отправим эти заявки на исполнение 
 			ordbs.publish(options.redisAcceptedOrdersStream, JSON.stringify( sell ), function(err, data){
-				
-			sys.puts('\n\n' + eye.inspect(data) + '\n\n');
-				
-				if (!err)
-					callBack(null);
+				//для случая, когда на той стороне никто не принимает (временно отвалился, например, акаунт сервере) 
+				if ((err) || (data < 1))
+				{
+					sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
+					
+					ordbs.rpush(options.redisMatchedOrdersQueue, JSON.stringify( sell ), function(err, data){
+						if (!err)
+							callBack(null);
+						else
+							callBack(err, data);
+					});
+				}
 				else
-					callBack(err, data);
+				{				
+					if (!err)
+						callBack(null);
+					else
+						callBack(err, data);
+				}
 			});
 		},
 		function(callBack){
 			//теперь отправим эти заявки на исполнение 
 			ordbs.publish(options.redisAcceptedOrdersStream, JSON.stringify( buy ), function(err, data){
-				if (!err)
-					callBack(null);
+				if ((err) || (data < 1))
+				{
+					sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
+					
+					ordbs.rpush(options.redisMatchedOrdersQueue, JSON.stringify( sell ), function(err, data){
+						if (!err)
+							callBack(null);
+						else
+							callBack(err, data);
+					});
+				}
 				else
-					callBack(err, data);
+				{				
+					if (!err)
+						callBack(null);
+					else
+						callBack(err, data);
+				}
 			});
 		},
 		function(callBack){
@@ -823,6 +788,7 @@ emitter.addListener('MQE_selectTopBook', function(a){
 		}
 	],
 	function(err, results){
+		//sys.puts(eye.inspect(err));
 		if (!err)
 		{
 			//var diff = process.hrtime(time1);
@@ -882,8 +848,8 @@ emitter.addListener('MQE_generateTestQuote', function(){
 	{
 		q.c = new Date().getTime() + Math.floor(Math.random() * (600 - 15 + 1)) + 15;	
 	}
-	
-	test.publish( options.redisOrdersStream, JSON.stringify( q ));
+
+	test.publish( options.redisOrdersStream, JSON.stringify( q ) );
 
 });
 
@@ -960,13 +926,13 @@ emitter.addListener('MQE_generateBestQuote', function(a){
 					if (result[1].d > result[0].d)
 						bestQuote.timestamp = result[1].d;
 					
-					var _json = JSON.stingify( bestQuote );
+					var _json = JSON.stringify( bestQuote );
 					//теперь публикуем в пабсаб и ложим в хеш последних котировок
-					ordbs.hset([options.redisCurrentQuoteHash, a, _json]);
+					ordbs.hset(options.redisCurrentQuoteHash, a, _json);
 					
 					ordbs.publish(options.redisLastQuoteStream, _json);	
 
-sys.puts('\n\n     Last:  ' + bestQuote.ask + ' / ' + bestQuote.bid + '       \n\n');
+					sys.log('[LAST/BEST] ' + bestQuote.ask + ' / ' + bestQuote.bid );
 					
 				}
 	});
@@ -992,9 +958,6 @@ emitter.addListener('MQE_publishAllBestQuote', function(){
 
 //===========================================================================================================
 sys.log('\n ===== Setting up runtime ======= \n');
-
-//	getPushServerInit();	
-		
 //===========================================================================================================
 
 
@@ -1018,9 +981,9 @@ setInterval(function(){
 		emitter.emit('MQE_generateTestQuote');
 	}
 
-}, 60000);
+}, 5000);
 
-emitter.emit('MQE_generateTestQuote');
+//emitter.emit('MQE_generateTestQuote');
 
 setInterval(function(){
 	
@@ -1039,13 +1002,6 @@ setInterval(function(){
 	emitter.emit('MQE_publishAllBestQuote');	
 }, options.bestQuotePublishInterval);
 
-
-
-/*
-process.nextTick(function(){
-	emitter.emit('MQE_selectTopBook', 'BTC/USD');
-});
-*/
 
 
 
