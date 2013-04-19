@@ -1,25 +1,22 @@
 ﻿/**  metaExchange Engine **/
 
-var sys 	= require('sys'),
-    net		= require('net'),
-	fs 		= require('fs'),
+var 	sys 	= require('sys'),
+    	net	= require('net'),
 	events  = require("events"),
-	http 	= require('http'),
 	eye 	= require('./lib/eyes'),
 	crypto 	= require('crypto'),
-	url     = require('url'),
 	RJSON   = require('./lib/rjson'),
 	redis   = require("./lib/node_redis2/index"),
 	async   = require('./lib/async'),
-	Buffer 	= require('buffer').Buffer;
+	Buffer 	= require('buffer').Buffer,	
+	_ 	= require('./lib/underscore');
 	
-	var _ = require('./lib/underscore');
-		_.mixin(require('./lib/underscore.string'));
+	_.mixin(require('./lib/underscore.string'));
 
 
 
 var emitter = new events.EventEmitter();
-var __HOST__ = 'opentradeengine.com'; //test
+var __HOST__ = 'openfxmarket.com'; //test
 var __STARTUP__ = new Date().getTime(); // время запуска сервера 
 
 //сведенья о последней ошибке 
