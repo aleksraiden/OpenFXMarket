@@ -6,7 +6,7 @@ var sys 	= require('sys'),
 	eye 	= require('./lib/eyes'),
 	crypto 	= require('crypto'),
 	RJSON   = require('./lib/rjson'),
-	redis   = require("./lib/node_redis3/index"),
+	redis   = require("./lib/node_redis2/index"),
 	async   = require('./lib/async'),	
 	Buffer 	= require('buffer').Buffer;
 	
@@ -42,8 +42,8 @@ var options = {
 	host : 'exchange.' + __HOST__,
 	
 	//RedisDB server 
-	redisPort: 6380,
-	redisHost: 'localhost',
+	redisPort: 6379,
+	redisHost: 'scylla.trdata.com',
 	redisConfig: {
 		parser: "javascript", //использовать hiredis, если есть возможность собрать и подключить 
 		//Setting this option to false can result in additional throughput at the cost of more latency.
@@ -63,6 +63,10 @@ var options = {
 	redisCurrentQuoteHash: 'MQE_LAST_QUOTES',
 	//канал, куда паблишим ордера, которые удачно добавлены в очереди
 	redisAcceptedOrdersStream: 'MQE_ACCEPTED_ORDERS_CHANNEL',
+	//канал, куда постим оредра, которые сматчены между собой (команды для изменения аккаунта)
+	redisMatchedOrdersStream: 'MQE_MATCHED_ORDERS_CHANNEL',
+	//это ордера просроченные 
+	redisExpiredOrdersStream: 'MQE_EXPIRED_ORDERS_CHANNEL',
 	//для случая, когда отваливается слушатель списка подтвержденных ордеров 
 	redisAcceptedOrdersQueue: 'MQE_ACCEPTED_ORDERS',
 	//канал, куда сообщаем ид ордеров, которые не прошли 
@@ -73,6 +77,8 @@ var options = {
 	redisAssetsTradeConfig: 'MQE_ASSETS_CONFIG',
 	//стрим для публикации последней котировки 
 	redisLastQuoteStream: 'MQE_LAST_QUOTES_CHANNEL',
+	//хеш для истории всех ордеров 
+	redisAllOrdersDB: 'MQE_ORDERS_DB',
 	
 	
 	//в каком формате принимать котировки (пока json, потом возможно более эффективный типа messagepack или protobuf)
@@ -85,7 +91,7 @@ var options = {
 	maxOrderLifetime: 0,
 	
 	//интервал чека стакана на предмет матчинга (в миллисекундах)
-	orderMatchInterval: 300,
+	orderMatchInterval: 1000,
 	
 	//сколько может быть паралельных торговых очередей (инструментов)
 	maxAssetsBook: 1000,
@@ -215,7 +221,8 @@ process.addListener('uncaughtException', function (err){
 	
 	ordbs.on("connect", function (err){
 		
-		//ordbs.select(2);
+		if (options.redisHost == 'scylla.trdata.com')
+			ordbs.select(2);
 		/*
 		ordbs.info(function(err, data){
 			sys.puts( '\n' + sys.inspect( data ) + '\n');
@@ -229,39 +236,44 @@ process.addListener('uncaughtException', function (err){
 //обработка  
 emitter.addListener('MQE_newOrder', function(data){
 	//по сути, нам ничего особо не нужно - добавить только в ордербук котировку
-
-	ordbs.zadd([ 
-				//вида: MQE_ORDERBOOK_BTC/USD_S (sell) или MQE_ORDERBOOK_BTC/USD_B (buy)
-				options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(), //это куда писать 
-				data.p,
-				data.__json				
-				], 
-				function(err, response){
-					if (!err)
-					{
-						//добавили? вышлем подтверждение, что мы приняли ордер  
-						ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, data){
-							//но, если там никто не слушает? 
-							if ((err) && (data < 1))
-							{
-								ordbs.rpush(options.redisAcceptedOrdersQueue, data._);
-							}
-						});
+	//пока временно здесь, потом перенести во фронтенд
+	ordbs.hset(options.redisAllOrdersDB, data._, function(err, result){
+		if (!err)
+		{		
+		ordbs.zadd([ 
+					//вида: MQE_ORDERBOOK_BTC/USD_S (sell) или MQE_ORDERBOOK_BTC/USD_B (buy)
+					options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(), //это куда писать 
+					data.p,
+					data.__json				
+					], 
+					function(err, response){
+						if (!err)
+						{
+							//добавили? вышлем подтверждение, что мы приняли ордер  
+							ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, data){
+								//но, если там никто не слушает? 
+								if ((err) && (data < 1))
+								{
+									ordbs.rpush(options.redisAcceptedOrdersQueue, data._);
+								}
+							});
+						}
+						else
+						{
+							sys.puts( eye.inspect( data ) );
+							sys.puts( eye.inspect( [err, response] ) );
+							
+							options.lastErroredOrderIds.push( data._ );
+							//запишем текст ошибки 
+							data.__error = response;
+							
+							//оповестим других про ошибочный ордер 
+							ordbs.publish(options.redisErroredOrdersStream, data);			
+						}
 					}
-					else
-					{
-						sys.puts( eye.inspect( data ) );
-						sys.puts( eye.inspect( [err, response] ) );
-						
-						options.lastErroredOrderIds.push( data._ );
-						//запишем текст ошибки 
-						data.__error = response;
-						
-						//оповестим других про ошибочный ордер 
-						ordbs.publish(options.redisErroredOrdersStream, data);			
-					}
-				}
-	);	
+		);
+		}
+	});
 });
 
 //собственно, сам матчинг енжайн 
@@ -302,10 +314,10 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 			},
 			//оповещаем об отмене 
 			function(callBack){
-				sell.__error = 'Order expired!';
-				sys.log('[EXPIRE] Order ' + sell.t + '  '+sell.f[0]+'#' + sell._ + ' has expired');
+				sell.__error = 'Expired';
+				//sys.log('[EXPIRE] Order ' + sell.t + '  '+sell.f[0]+'#' + sell._ + ' has expired');
 				
-				ordbs.publish(options.redisErroredOrdersStream, sell, function(err, result){
+				ordbs.publish(options.redisExpiredOrdersStream, sell._, function(err, result){
 					if (err)
 							callBack(1, '[DELETE/Sell(Notify timeout)] ERROR: ' + err + '   ' + result);
 						else
@@ -327,10 +339,10 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 			},
 			//оповещаем об отмене 
 			function(callBack){
-				buy.__error = 'Order expired!';
-				sys.log('[EXPIRE] Order ' + sell.t +'  '+sell.f[0]+'#' + sell._ + ' has expired');
+				buy.__error = 'Expired';
+				//sys.log('[EXPIRE] Order ' + sell.t +'  '+sell.f[0]+'#' + sell._ + ' has expired');
 				
-				ordbs.publish(options.redisErroredOrdersStream, buy, function(err, result){
+				ordbs.publish(options.redisExpiredOrdersStream, buy._, function(err, result){
 					if (err)
 							callBack(1, '[DELETE/Buy(Notify timeout)] ERROR: ' + err + '   ' + result);
 						else
@@ -611,7 +623,7 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 	async.parallel([
 		function(callBack){
 			//теперь отправим эти заявки на исполнение 
-			ordbs.publish(options.redisAcceptedOrdersStream, JSON.stringify( sell ), function(err, data){
+			ordbs.publish(options.redisMatchedOrdersStream, JSON.stringify( sell ), function(err, data){
 				//для случая, когда на той стороне никто не принимает (временно отвалился, например, акаунт сервере) 
 				if ((err) || (data < 1))
 				{
@@ -635,7 +647,7 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 		},
 		function(callBack){
 			//теперь отправим эти заявки на исполнение 
-			ordbs.publish(options.redisAcceptedOrdersStream, JSON.stringify( buy ), function(err, data){
+			ordbs.publish(options.redisMatchedOrdersStream, JSON.stringify( buy ), function(err, data){
 				if ((err) || (data < 1))
 				{
 					sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
@@ -818,7 +830,12 @@ emitter.addListener('MQE_generateTestQuote', function(){
 		f : 'P00000000'
 	};
 	
-	q._ = q.d + '' + process.hrtime()[1];
+	var _ = process.hrtime()[1];
+		//выравниваем по длине 
+		if (_ < 100)
+			_ = _ + 100;
+	
+	q._ = q.d + '' + _;
 	
 	if (Math.random() > 0.5)
 		q.t = 'b';
@@ -849,7 +866,7 @@ emitter.addListener('MQE_generateTestQuote', function(){
 		q.c = new Date().getTime() + Math.floor(Math.random() * (600 - 15 + 1)) + 15;	
 	}
 
-	test.publish( options.redisOrdersStream, JSON.stringify( q ) );
+	test.publish( options.redisOrdersStream, JSON.stringify( q )); 
 
 });
 
@@ -981,7 +998,7 @@ setInterval(function(){
 		emitter.emit('MQE_generateTestQuote');
 	}
 
-}, 5000);
+}, 15000);
 
 //emitter.emit('MQE_generateTestQuote');
 
