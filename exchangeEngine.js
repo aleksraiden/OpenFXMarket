@@ -42,8 +42,8 @@ var options = {
 	host : 'exchange.' + __HOST__,
 	
 	//RedisDB server 
-	redisPort: 6379,
-	redisHost: 'scylla.trdata.com',
+	redisPort: 6380,
+	redisHost: 'localhost',
 	redisConfig: {
 		parser: "javascript", //использовать hiredis, если есть возможность собрать и подключить 
 		//Setting this option to false can result in additional throughput at the cost of more latency.
