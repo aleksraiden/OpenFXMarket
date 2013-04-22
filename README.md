@@ -1,8 +1,9 @@
-MetaQuoterExchange
+OpenFXMarket
 ==================
 
 Fast abstract market exchange (orderbook and order matching engine)
 
+Проект получил свое имя и домен: openfxmarket.com (сайт скоро будет). 
 
 
 Data Format Spec
