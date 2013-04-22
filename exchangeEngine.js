@@ -1,44 +1,38 @@
-﻿/**  metaExchange Engine **/
+﻿/**  openFXMarket - exchange Engine **/
 
 var sys 	= require('sys'),
     net		= require('net'),
 	events  = require("events"),
 	eye 	= require('./lib/eyes'),
 	crypto 	= require('crypto'),
-	RJSON   = require('./lib/rjson'),
 	redis   = require("./lib/node_redis2/index"),
 	async   = require('./lib/async'),	
 	Buffer 	= require('buffer').Buffer;
 	
 var _ = require('./lib/underscore');
-
-
-
 var emitter = new events.EventEmitter();
 var __HOST__ = 'openfxmarket.com'; //test
 var __STARTUP__ = new Date().getTime(); // время запуска сервера 
 
-//сведенья о последней ошибке 
-var lastUncaughtException = {
-	error: '',
-	errorAt: 0
-};
-
-emitter.addListener('error', function(exc){
-	sys.log(eye.inspect(exc));
+//исключение, которое нигде не было перехвачено ранее
+process.addListener('uncaughtException', function (err){
+  sys.puts('\n\n');
+  sys.log('Caught exception: ' + err.message);
+  sys.log(eye.inspect(err.stack));
+  sys.puts('\n\n');
+  
+  return true;  
 });
 
 sys.puts('\n\n');
-sys.puts(' ====== openFxMarket.com ====== \n');
-sys.puts(' ====== 2013 (c) AGPsource.com ====== \n');
-sys.puts(' ====== metaQuote Exchange Engine 0.1 at ' + __HOST__ + ' (Test) ======= ');
+sys.puts(' ====== openFxMarket.com ======');
+sys.puts(' ====== 2013 (c) AGPsource.com ====== ');
+sys.puts(' ====== Info: aleks.raiden@gmail.com ====== \n\n\n');
+sys.puts(' ====== exchange Engine 0.1 at ' + __HOST__ + ' (Dev version) ======= ');
 sys.puts('\n\n');
 
 // общий обьект настроек сервера
 var options = {
-	//конфиг для Flash socket server 
-	encoding : 'utf8',
-	port: 443,
 	host : 'exchange.' + __HOST__,
 	
 	//RedisDB server 
@@ -145,20 +139,10 @@ var options = {
 	
 	
 };
+	//последняя котировка 
+	var __LAST_ORDER__ = {};
 
-//исключение, которое нигде не было перехвачено ранее
-process.addListener('uncaughtException', function (err){
-  sys.puts('\n\n');
-  sys.log('Caught exception: ' + err.message);
-  sys.log(eye.inspect(err.stack));
-  sys.puts('\n\n');
-  
-  lastUncaughtException.error = err.message;
-  lastUncaughtException.errorAt = new Date().getTime();
-  
-  return true;  
-});
-
+	//Глобальный флаг, включает дебаг-режим протокола редиса 
 	redis.debug_mode = false;
 	
 	//это выделенное подключение для Pub/Sub
@@ -221,28 +205,25 @@ process.addListener('uncaughtException', function (err){
 	
 	ordbs.on("connect", function (err){
 		
+		//тестовый код для моего сервера 
 		if (options.redisHost == 'scylla.trdata.com')
 			ordbs.select(2);
-		/*
-		ordbs.info(function(err, data){
-			sys.puts( '\n' + sys.inspect( data ) + '\n');
-		});
-		*/
-		
+	
 		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 	});
 	
 //=================
-//обработка  
+
+//Поступил новый ордер нам 
 emitter.addListener('MQE_newOrder', function(data){
 	//по сути, нам ничего особо не нужно - добавить только в ордербук котировку
 	//пока временно здесь, потом перенести во фронтенд
-	ordbs.hset(options.redisAllOrdersDB, data._, function(err, result){
+	ordbs.hset(options.redisAllOrdersDB, data._, data.__json, function(err, result){
 		if (!err)
 		{		
 		ordbs.zadd([ 
 					//вида: MQE_ORDERBOOK_BTC/USD_S (sell) или MQE_ORDERBOOK_BTC/USD_B (buy)
-					options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(), //это куда писать 
+					options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(),
 					data.p,
 					data.__json				
 					], 
@@ -250,19 +231,25 @@ emitter.addListener('MQE_newOrder', function(data){
 						if (!err)
 						{
 							//добавили? вышлем подтверждение, что мы приняли ордер  
-							ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, data){
+							ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, resp){
 								//но, если там никто не слушает? 
-								if ((err) && (data < 1))
+								if ((err) && (resp < 1))
 								{
 									ordbs.rpush(options.redisAcceptedOrdersQueue, data._);
 								}
+								
+								//запомним последнюю котировку (не применимо к маркет-ордерам) 
+								if (data.f[0] == 'L')
+								{
+									if (_.isUndefined(__LAST_ORDER__[ data.a.toUpperCase() ]))
+										__LAST_ORDER__[ data.a.toUpperCase() ] = {S:null,B:null};
+										
+									__LAST_ORDER__[ data.a.toUpperCase() ][ data.t.toUpperCase() ] = data;
+								}								
 							});
 						}
 						else
 						{
-							sys.puts( eye.inspect( data ) );
-							sys.puts( eye.inspect( [err, response] ) );
-							
 							options.lastErroredOrderIds.push( data._ );
 							//запишем текст ошибки 
 							data.__error = response;
@@ -271,7 +258,7 @@ emitter.addListener('MQE_newOrder', function(data){
 							ordbs.publish(options.redisErroredOrdersStream, data);			
 						}
 					}
-		);
+				);
 		}
 	});
 });
@@ -280,12 +267,6 @@ emitter.addListener('MQE_newOrder', function(data){
 emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 	//sys.log('==== [MATCH ENGINE] ===== ');
 	//sys.puts( eye.inspect( [sell, buy] ) );
-	//sys.puts('\n=========================\n');	
-    //return;
-	//не матчим ордера: lastMatchedOrderIds (лучше удалять через ZREM 
-	
-	//допустим, пока матчим только limit-ордера, игнорируем обьемы пока что, только цена 
-	
 	//sys.puts('\n======= WARNING! TEST MODE! ============= \n');
 	
 	//если хотя купить за цену == или больше, чем лучшая заявка на продажу - матчим оба 
@@ -296,7 +277,6 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 		
 	if ((sell.c != 0) || (buy.c != 0))
 	{
-		//var _sell = _.clone(sell), _bid = _.clone(buy);
 		//проверка, может ордера устарели 
 		async.parallel([
 			//убираем с очереди 
@@ -308,21 +288,19 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 						if (err)
 							callBack(1, '[DELETE/Sell(timeout)] ERROR: ' + err + '   ' + result);
 						else
-							callBack(null);
+						{
+sys.log('[EXPIRE] Order ' + sell.t + '  '+sell.f[0]+'#' + sell._ + ' has expired');
+							ordbs.publish(options.redisExpiredOrdersStream, sell._, function(err, result){
+								if (err)
+									callBack(1, '[DELETE/Sell(Notify timeout)] ERROR: ' + err + '   ' + result);
+								else
+									callBack(null);	
+							});	
+						}
 					});
 				}
-			},
-			//оповещаем об отмене 
-			function(callBack){
-				sell.__error = 'Expired';
-				//sys.log('[EXPIRE] Order ' + sell.t + '  '+sell.f[0]+'#' + sell._ + ' has expired');
-				
-				ordbs.publish(options.redisExpiredOrdersStream, sell._, function(err, result){
-					if (err)
-							callBack(1, '[DELETE/Sell(Notify timeout)] ERROR: ' + err + '   ' + result);
-						else
-							callBack(null);	
-				});			
+				else
+					callBack(null);
 			},
 			//так же с бай-ордерами 
 			function(callBack){
@@ -333,21 +311,19 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 						if (err)
 							callBack(1, '[DELETE/Buy(timeout)] ERROR: ' + err + '   ' + result);
 						else
-							callBack(null);
+						{
+sys.log('[EXPIRE] Order ' + buy.t +'  '+buy.f[0]+'#' + buy._ + ' has expired');
+							ordbs.publish(options.redisExpiredOrdersStream, buy._, function(err, result){
+								if (err)
+									callBack(1, '[DELETE/Buy(Notify timeout)] ERROR: ' + err + '   ' + result);
+								else
+									callBack(null);	
+							});	
+						}
 					});
 				}
-			},
-			//оповещаем об отмене 
-			function(callBack){
-				buy.__error = 'Expired';
-				//sys.log('[EXPIRE] Order ' + sell.t +'  '+sell.f[0]+'#' + sell._ + ' has expired');
-				
-				ordbs.publish(options.redisExpiredOrdersStream, buy._, function(err, result){
-					if (err)
-							callBack(1, '[DELETE/Buy(Notify timeout)] ERROR: ' + err + '   ' + result);
-						else
-							callBack(null);	
-				});			
+				else
+					callBack(null);
 			}],
 			function(err, results){
 				if (!err)
@@ -358,6 +334,7 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 		);	
 	}
 	
+	//дополнительная проверка 
 	if (((sell.c != 0) && (sell.c <= _nowDt)) || ((buy.c != 0) && (buy.c <= _nowDt)))
 		return;	
 	
@@ -627,7 +604,7 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 				//для случая, когда на той стороне никто не принимает (временно отвалился, например, акаунт сервере) 
 				if ((err) || (data < 1))
 				{
-					sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
+					//sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
 					
 					ordbs.rpush(options.redisMatchedOrdersQueue, JSON.stringify( sell ), function(err, data){
 						if (!err)
@@ -650,7 +627,7 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 			ordbs.publish(options.redisMatchedOrdersStream, JSON.stringify( buy ), function(err, data){
 				if ((err) || (data < 1))
 				{
-					sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
+					//sys.log('[ERROR] No one readers for AcceptedOrdersStream. Orders queued');
 					
 					ordbs.rpush(options.redisMatchedOrdersQueue, JSON.stringify( sell ), function(err, data){
 						if (!err)
@@ -800,14 +777,9 @@ emitter.addListener('MQE_selectTopBook', function(a){
 		}
 	],
 	function(err, results){
-		//sys.puts(eye.inspect(err));
 		if (!err)
 		{
-			//var diff = process.hrtime(time1);
-			
 			emitter.emit('MQE_matchEngine', a, results[0][0], results[1][0]);
-			
-			//sys.log('Select match took '+(diff[0] * 1e9 + diff[1])+' nanoseconds');
 		}		
 	});
 });
@@ -830,18 +802,18 @@ emitter.addListener('MQE_generateTestQuote', function(){
 		f : 'P00000000'
 	};
 	
-	var _ = process.hrtime()[1];
+	var _t = process.hrtime()[1];
 		//выравниваем по длине 
-		if (_ < 100)
-			_ = _ + 100;
+		if (_t < 100)
+			_t = _t + 100;
 	
-	q._ = q.d + '' + _;
+	q._ = q.d + '' + _t;
 	
 	if (Math.random() > 0.5)
 		q.t = 'b';
 	
 	q.p = Number(Number( Math.random() ).toFixed(3));   //.replace("'",'');
-	q.v = Math.floor(Math.random() * (1000 - 1 + 1)) + 1;
+	q.v = _.random(1, 1000);
 	q.s = Number( q.p * q.v ); //.toFixed(9).replace("'",'');
 	
 	//для маркет-ордера цена 0 
@@ -863,7 +835,7 @@ emitter.addListener('MQE_generateTestQuote', function(){
 	//тестируем котировко с лайфтаймом 
 	if (Math.random() > 0.8)
 	{
-		q.c = new Date().getTime() + Math.floor(Math.random() * (600 - 15 + 1)) + 15;	
+		q.c = new Date().getTime() + _.random(1, 600);
 	}
 
 	test.publish( options.redisOrdersStream, JSON.stringify( q )); 
@@ -934,6 +906,7 @@ emitter.addListener('MQE_generateBestQuote', function(a){
 					//var _best_sell = result[0], _best_buy = result[1];
 								
 					var bestQuote = {
+						type: 'best',
 						code: a,
 						ask: result[0].p,
 						bid: result[1].p,
@@ -949,8 +922,39 @@ emitter.addListener('MQE_generateBestQuote', function(a){
 					
 					ordbs.publish(options.redisLastQuoteStream, _json);	
 
-					sys.log('[LAST/BEST] ' + bestQuote.ask + ' / ' + bestQuote.bid );
+					sys.log('[BEST] ' + bestQuote.ask + ' / ' + bestQuote.bid );
 					
+					//а ласт у нас и так есть 
+					if (_.isUndefined( __LAST_ORDER__[ a.toUpperCase() ] ))
+						return;	
+					
+					var _last = __LAST_ORDER__[ a.toUpperCase() ];
+					
+					var lastQuote = {
+						type: 'last',
+						code: a,
+						ask: null,
+						bid: null,
+						timestamp: 0
+					};
+					
+					if (!_.isUndefined(_last['S']))
+						lastQuote.ask = _last['S'].p;					
+					
+					if (!_.isUndefined(_last['B']))
+						lastQuote.bid = _last['B'].p;
+						
+					if (_last['S'].d >= _last['B'].d)
+						lastQuote.timestamp = _last['S'].d;
+					else
+						lastQuote.timestamp = _last['B'].d;
+						
+					if (lastQuote.timestamp == 0)
+						lastQuote.timestamp = new Date().getTime();
+						
+					//паблишим котировку 
+					ordbs.publish(options.redisLastQuoteStream, JSON.stringify(lastQuote));
+					sys.log('[LAST] ' + lastQuote.ask + ' / ' + lastQuote.bid );					
 				}
 	});
 
@@ -974,7 +978,7 @@ emitter.addListener('MQE_publishAllBestQuote', function(){
 
 
 //===========================================================================================================
-sys.log('\n ===== Setting up runtime ======= \n');
+sys.log(' ===== Setting up runtime ======= ');
 //===========================================================================================================
 
 
