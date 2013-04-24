@@ -24,6 +24,52 @@ process.addListener('uncaughtException', function (err){
   return true;  
 });
 
+function array_chunk (input, size, preserve_keys) {
+  // http://kevin.vanzonneveld.net
+  // +   original by: Carlos R. L. Rodrigues (http://www.jsfromhell.com)
+  // +   improved by: Brett Zamir (http://brett-zamir.me)
+  // %        note 1: Important note: Per the ECMAScript specification, objects may not always iterate in a predictable order
+  var x, p = '', i = 0, c = -1, l = input.length || 0, n = [];
+
+  if (size < 1) {
+    return null;
+  }
+
+  if (Object.prototype.toString.call(input) === '[object Array]') {
+    if (preserve_keys) {
+      while (i < l) {
+        (x = i % size) ? n[c][i] = input[i] : n[++c] = {}, n[c][i] = input[i];
+        i++;
+      }
+    }
+    else {
+      while (i < l) {
+        (x = i % size) ? n[c][x] = input[i] : n[++c] = [input[i]];
+        i++;
+      }
+    }
+  }
+  else {
+    if (preserve_keys) {
+      for (p in input) {
+        if (input.hasOwnProperty(p)) {
+          (x = i % size) ? n[c][p] = input[p] : n[++c] = {}, n[c][p] = input[p];
+          i++;
+        }
+      }
+    }
+    else {
+      for (p in input) {
+        if (input.hasOwnProperty(p)) {
+          (x = i % size) ? n[c][x] = input[p] : n[++c] = [input[p]];
+          i++;
+        }
+      }
+    }
+  }
+  return n;
+}
+
 sys.puts('\n\n');
 sys.puts(' ====== openFxMarket.com ======');
 sys.puts(' ====== 2013 (c) AGPsource.com ====== ');
@@ -65,14 +111,16 @@ var options = {
 	redisAcceptedOrdersQueue: 'MQE_ACCEPTED_ORDERS',
 	//канал, куда сообщаем ид ордеров, которые не прошли 
 	redisErroredOrdersStream: 'MQE_ERRORED_ORDERS_CHANNEL',
-	//сет для ордеров, которые выбрали для матча, но еще не обработали 
-	//redisProcessingOrders: 'MQE_PROCESSED_ORDERS',
 	//где храним, по каким инструментам торгуем 
 	redisAssetsTradeConfig: 'MQE_ASSETS_CONFIG',
 	//стрим для публикации последней котировки 
 	redisLastQuoteStream: 'MQE_LAST_QUOTES_CHANNEL',
 	//хеш для истории всех ордеров 
 	redisAllOrdersDB: 'MQE_ORDERS_DB',
+	//для хранения експайров надо отдельный сортед сет (чтобы выбирать одним запросом)
+	redisOrderExpiresSet: 'MQE_EXPIRES_ORDERSTORE_',
+	//глобальная таблица статусов ордеров (hash table)
+	redisGlobalOrderStatus: 'MQE_GLOBAL_ORDERS_STATUS',
 	
 	
 	//в каком формате принимать котировки (пока json, потом возможно более эффективный типа messagepack или protobuf)
@@ -86,6 +134,9 @@ var options = {
 	
 	//интервал чека стакана на предмет матчинга (в миллисекундах)
 	orderMatchInterval: 1000,
+	
+	//как часто проверять експайринг (для топ-оф-бук он проверяется при каждом матчинге)
+	orderExpaireInterval: 1000,
 	
 	//сколько может быть паралельных торговых очередей (инструментов)
 	maxAssetsBook: 1000,
@@ -178,6 +229,7 @@ var options = {
 				{
 					//у нас новый ордер 
 //sys.log('[NEW ORDER] ' + _msg._ + ' / ' + _msg.a);
+//sys.puts(eye.inspect( _msg ));
 					emitter.emit('MQE_newOrder', _msg);
 				}
 				else
@@ -204,11 +256,6 @@ var options = {
 	});
 	
 	ordbs.on("connect", function (err){
-		
-		//тестовый код для моего сервера 
-		if (options.redisHost == 'scylla.trdata.com')
-			ordbs.select(2);
-	
 		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 	});
 	
@@ -218,48 +265,69 @@ var options = {
 emitter.addListener('MQE_newOrder', function(data){
 	//по сути, нам ничего особо не нужно - добавить только в ордербук котировку
 	//пока временно здесь, потом перенести во фронтенд
-	ordbs.hset(options.redisAllOrdersDB, data._, data.__json, function(err, result){
-		if (!err)
-		{		
-		ordbs.zadd([ 
+	var _trans = ordbs.multi();
+	
+	async.parallel([
+		//сохранение котировки в общий хеш 
+		function(callBack){
+			_trans.hset(options.redisAllOrdersDB, data._, JSON.stringify(data), function(err, result){});
+			
+			callBack(null);
+		},
+		function(callBack){
+			_trans.zadd([ 
 					//вида: MQE_ORDERBOOK_BTC/USD_S (sell) или MQE_ORDERBOOK_BTC/USD_B (buy)
 					options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(),
 					data.p,
 					data.__json				
-					], 
-					function(err, response){
-						if (!err)
+					], function(err, response){});
+			
+			callBack(null);
+		},
+		function(callBack){
+			if  (data.c != 0)
+			{
+				//sys.log('[==EXPIRE==] Clear at: ' + data.c);
+				ordbs.zadd([options.redisOrderExpiresSet + data.a.toUpperCase(), data.c, data._], function(err, response){});
+			}
+			
+			callBack(null);
+		}], 
+		function(err, responce){
+			 //sys.log('----- ----------- finish ---------- -----');
+			 // drains multi queue and runs atomically
+			_trans.exec(function (err, replies) {
+				if (!err)
+				{
+					//добавили? вышлем подтверждение, что мы приняли ордер  
+					ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, resp){
+						//но, если там никто не слушает? 
+						if ((err) && (resp < 1))
 						{
-							//добавили? вышлем подтверждение, что мы приняли ордер  
-							ordbs.publish(options.redisAcceptedOrdersStream, data._, function(err, resp){
-								//но, если там никто не слушает? 
-								if ((err) && (resp < 1))
-								{
-									ordbs.rpush(options.redisAcceptedOrdersQueue, data._);
-								}
+							ordbs.rpush(options.redisAcceptedOrdersQueue, data._);
+						}
 								
-								//запомним последнюю котировку (не применимо к маркет-ордерам) 
-								if (data.f[0] == 'L')
-								{
-									if (_.isUndefined(__LAST_ORDER__[ data.a.toUpperCase() ]))
-										__LAST_ORDER__[ data.a.toUpperCase() ] = {S:null,B:null};
-										
-									__LAST_ORDER__[ data.a.toUpperCase() ][ data.t.toUpperCase() ] = data;
-								}								
-							});
-						}
-						else
+						//запомним последнюю котировку (не применимо к маркет-ордерам) 
+						if (data.f[0] == 'L')
 						{
-							options.lastErroredOrderIds.push( data._ );
-							//запишем текст ошибки 
-							data.__error = response;
-							
-							//оповестим других про ошибочный ордер 
-							ordbs.publish(options.redisErroredOrdersStream, data);			
+							if (_.isUndefined(__LAST_ORDER__[ data.a.toUpperCase() ]))
+								__LAST_ORDER__[ data.a.toUpperCase() ] = {S:null,B:null};
+								
+							__LAST_ORDER__[ data.a.toUpperCase() ][ data.t.toUpperCase() ] = data;
 						}
-					}
-				);
-		}
+					});				
+				}
+				else
+				{
+					options.lastErroredOrderIds.push( data._ );
+					
+					//запишем текст ошибки 
+					data.__error = response;
+							
+					//оповестим других про ошибочный ордер 
+					ordbs.publish(options.redisErroredOrdersStream, JSON.stringify(data));				
+				}			
+		});
 	});
 });
 
@@ -274,67 +342,8 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 	
 	//для поддержки ордеров с експайром 
 	var _nowDt = new Date().getTime();
-		
-	if ((sell.c != 0) || (buy.c != 0))
-	{
-		//проверка, может ордера устарели 
-		async.parallel([
-			//убираем с очереди 
-			function(callBack){
-				if ((sell.c != 0) && (sell.c <= _nowDt))
-				{
-					//убрать этот ордер вообще 
-					ordbs.zrem(options.redisOrderbookPrefix + a.toUpperCase() + '_S', sell.__json, function(err, result){
-						if (err)
-							callBack(1, '[DELETE/Sell(timeout)] ERROR: ' + err + '   ' + result);
-						else
-						{
-sys.log('[EXPIRE] Order ' + sell.t + '  '+sell.f[0]+'#' + sell._ + ' has expired');
-							ordbs.publish(options.redisExpiredOrdersStream, sell._, function(err, result){
-								if (err)
-									callBack(1, '[DELETE/Sell(Notify timeout)] ERROR: ' + err + '   ' + result);
-								else
-									callBack(null);	
-							});	
-						}
-					});
-				}
-				else
-					callBack(null);
-			},
-			//так же с бай-ордерами 
-			function(callBack){
-				if ((buy.c != 0) && (buy.c <= _nowDt))
-				{
-					//убрать этот ордер вообще 
-					ordbs.zrem(options.redisOrderbookPrefix + a.toUpperCase() + '_B', buy.__json, function(err, result){
-						if (err)
-							callBack(1, '[DELETE/Buy(timeout)] ERROR: ' + err + '   ' + result);
-						else
-						{
-sys.log('[EXPIRE] Order ' + buy.t +'  '+buy.f[0]+'#' + buy._ + ' has expired');
-							ordbs.publish(options.redisExpiredOrdersStream, buy._, function(err, result){
-								if (err)
-									callBack(1, '[DELETE/Buy(Notify timeout)] ERROR: ' + err + '   ' + result);
-								else
-									callBack(null);	
-							});	
-						}
-					});
-				}
-				else
-					callBack(null);
-			}],
-			function(err, results){
-				if (!err)
-				{
-					return true;
-				}			
-			}
-		);	
-	}
-	
-	//дополнительная проверка 
+
+	//не матчим устаревшие котировки, ни будут убраны отдельно  
 	if (((sell.c != 0) && (sell.c <= _nowDt)) || ((buy.c != 0) && (buy.c <= _nowDt)))
 		return;	
 	
@@ -729,8 +738,6 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 emitter.addListener('MQE_selectTopBook', function(a){
 	if (typeof(a) == 'undefined')	a = 'BTC/USD';
 	
-	//var _book = {'s':null,'b':null};
-//var time1 = process.hrtime();	
 	//получить топ буков: для продажи - минимум цены, для покупки: максимум 
 	async.parallel([
 		function(callBack){
@@ -784,6 +791,94 @@ emitter.addListener('MQE_selectTopBook', function(a){
 	});
 });
 
+//проверка на експайринг ордеров 
+emitter.addListener('MQE_selectExpireOrders', function(a){
+	//мы выбираем из сета все ордера, которуе уже проекспайрены 
+	var _now = new Date().getTime();
+
+	//выбрать все, кто равен или меньше текущего 
+	ordbs.zrevrangebyscore([
+					options.redisOrderExpiresSet + a.toUpperCase(),
+					'(' + _now,
+					'(0',
+					'WITHSCORES'  //TODO: здесь можно ускорить, убрав тестовый параметр WITHSCORES
+					], 
+		function(err, data){
+			if (!err) 
+			{
+				if (data.length > 0)
+				{
+					var _expk = array_chunk(data, 2, false);
+									
+					sys.log('[EXPIRE] To expired: ' + _expk.length + ' orders');
+					
+					_.each(_expk, function(el){
+						emitter.emit('MQE_orderExpire', el[0], a);					
+					});
+				}			
+			}
+			else
+			{
+				sys.puts('\n================\n' + eye.inspect(data) + '\n================\n');
+			}
+		}
+	);
+});
+
+//обработка експайра одной котировки 
+// получаем ид ордера и код инструмента вида BTC/USD 
+emitter.addListener('MQE_orderExpire', function(orderId, a){
+	//первым делом получить ордер из общего стора 
+	ordbs.hget(options.redisAllOrdersDB, orderId, function(err, data){
+		if (!err)
+		{
+			var order = JSON.parse( data );
+			
+			//теперь удаляем из общего сета (вопрос надо ли?, пока оставим options.redisAllOrdersDB
+			async.parallel([
+				//удаление из ордербука 
+				function(callBack){
+					var _orderbook = options.redisOrderbookPrefix + a.toUpperCase() + '_' + order.t.toUpperCase();
+					
+					ordbs.zrem(_orderbook, order.__json, function(err, res){
+						if (!err)
+							callBack(null);
+						else
+							callBack(res);
+					});			
+				},
+				//из таблицы с експайрами 
+				function(callBack){
+					ordbs.zrem(options.redisOrderExpiresSet + a.toUpperCase(), orderId, function(err, res){
+						if (!err)
+							callBack(null);
+						else
+							callBack(res);
+					});			
+				},
+				//выставить глобал ордер статус 
+				function(callBack){
+					ordbs.hset(options.redisGlobalOrderStatus, orderId, '[EXPIRED] Order expired', function(err, res){
+						if (!err)
+							callBack(null);
+						else
+							callBack(res);
+					});			
+				}], 
+				function(err, responce){
+				
+					if(!err)
+					{
+						//оповещаем внешние сервисы 
+						sys.log('[EXPIRE] Order ' + order.t + '  '+order.f[0]+'#' + order._ + ' has expired');
+						
+						ordbs.publish(options.redisExpiredOrdersStream, order._, function(err, result){});					
+					}
+			
+			});
+		}	
+	});
+});
 
 //генерация фейковой котировки 
 emitter.addListener('MQE_generateTestQuote', function(){
@@ -833,11 +928,11 @@ emitter.addListener('MQE_generateTestQuote', function(){
 		q.f = 'L' + q.f;
 	
 	//тестируем котировко с лайфтаймом 
-	if (Math.random() > 0.8)
+	if (Math.random() > 0.75)
 	{
-		q.c = new Date().getTime() + _.random(1, 600);
+		q.c = new Date().getTime() + (_.random(1, 600) * 1000);
 	}
-
+//sys.puts( eye.inspect( q ) );
 	test.publish( options.redisOrdersStream, JSON.stringify( q )); 
 
 });
@@ -980,6 +1075,9 @@ emitter.addListener('MQE_publishAllBestQuote', function(){
 //===========================================================================================================
 sys.log(' ===== Setting up runtime ======= ');
 //===========================================================================================================
+//new Date().getTime()
+
+
 
 
 //== Test 
@@ -996,8 +1094,8 @@ var test = redis.createClient(options.redisPort, options.redisHost, {
 	});
 
 setInterval(function(){
-	sys.log('================== Gen +500 orders ========================');
-	for (var i = 0; i < 1000; i++)
+	sys.log('================== Gen +500 orders ========================');   
+	for (var i = 0; i < 500; i++)
 	{
 		emitter.emit('MQE_generateTestQuote');
 	}
@@ -1005,6 +1103,8 @@ setInterval(function(){
 }, 15000);
 
 //emitter.emit('MQE_generateTestQuote');
+
+
 
 setInterval(function(){
 	
@@ -1016,6 +1116,20 @@ setInterval(function(){
 	});
 
 }, options.orderMatchInterval);
+
+//таймер експайринга 
+
+
+setInterval(function(){
+	
+	_.each(options.assets, function(x){
+		if (x.trade == 'open')
+		{
+			emitter.emit('MQE_selectExpireOrders', x.code);
+		}	
+	});
+
+}, options.orderExpaireInterval);
 
 
 //ставим генерацию лучшей котировки 
