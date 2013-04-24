@@ -81,6 +81,8 @@ sys.puts('\n\n');
 var options = {
 	host : 'exchange.' + __HOST__,
 	
+	exchangeId: null, //уникальный ид сервера, генерируется при страрте, если не задан 
+	
 	//RedisDB server 
 	redisPort: 6380,
 	redisHost: 'localhost',
@@ -121,6 +123,8 @@ var options = {
 	redisOrderExpiresSet: 'MQE_EXPIRES_ORDERSTORE_',
 	//глобальная таблица статусов ордеров (hash table)
 	redisGlobalOrderStatus: 'MQE_GLOBAL_ORDERS_STATUS',
+	//канал для оповещения других нод о своей работе 
+	redisNodeNotificator: 'MQE_NODES_NOTIFY_CHANNEL',
 	
 	
 	//в каком формате принимать котировки (пока json, потом возможно более эффективный типа messagepack или protobuf)
@@ -157,8 +161,10 @@ var options = {
 	
 	//список известных инструментов системе 
 	//эти данные нужны и account-сервису для расчета баланса.
-	assets : [
-		{
+	assets : [],
+	
+	//в тестовом варианте дефолтный конфиг
+	__defaultAssetConfig: {
 			code: 'BTC/USD',
 			desc: 'Валютная пара Bitcoin/USD',
 			trade: 'open',
@@ -180,8 +186,7 @@ var options = {
 				sell: 0.001, //коммисия с продажи 
 				buy:  0.001  // коммисия с покупки
 			}			
-		}	
-	],
+		},
 	
 	//локальная копия списка с ошибками
 	lastErroredOrderIds:[],
@@ -236,7 +241,7 @@ var options = {
 				if (ch == options.redisControlsStream)
 				{
 					//у нас новая команда 
-					emitter.emit('MQE_newOrder', _msg);
+					//emitter.emit('MQE_newOrder', _msg);
 				}			
 			}
 		}catch(e){
@@ -256,10 +261,87 @@ var options = {
 	});
 	
 	ordbs.on("connect", function (err){
+		
+		emitter.emit('MQE_loadStartUpConfig', function(){
+			emitter.emit('MQE_readyToWork');
+		});
+	
 		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 	});
 	
+	//храним ид таймеров разных 
+	var _timers = {};
+	
 //=================
+//загружает конфигурацию торговых очередей и инструментов, потом вызивает уже стартовый калбек 
+emitter.addListener('MQE_loadStartUpConfig', function(callBack){
+	//для начала достанем конфигурацию
+	ordbs.hgetall(options.redisAssetsTradeConfig, function(err, data){
+		sys.puts( eye.inspect( data ) ) ;
+		
+		if (_.isEmpty(data))
+		{
+			//клонируем дефолт 
+			data = [];
+			data.push( _.clone(options.__defaultAssetConfig) );
+		}
+		
+		_.each(data, function(obj){
+			sys.log('[INFO] Support asset: ' + obj.code + ' / ' + obj.desc);
+				
+			options.assets.push( obj );
+		});		
+		
+		
+		if (options.exchangeId == null)
+		{
+			options.exchangeId = 'ex' + new Date().getTime() + '_' + _.random(1, 9999);
+		}
+			
+		//оповестим всех, что мы работаем 
+		ordbs.publish(options.redisNodeNotificator, JSON.stringify({
+			node: options.exchangeId,
+			startTs: __STARTUP__,
+			status: 'startup'
+		}));
+				
+		if (_.isFunction(callBack))
+			callBack();
+	});	
+});
+
+
+//сигнал, что мы можем начинать работать 
+emitter.addListener('MQE_readyToWork', function(){
+
+	//таймер матчинга ордеров 
+	_timers.orderMatchIntervalTimer = setInterval(function(){
+		_.each(options.assets, function(x){
+			if (x.trade == 'open')
+			{
+				emitter.emit('MQE_selectTopBook', x.code);
+			}	
+		});
+	}, options.orderMatchInterval);
+
+	//таймер експайринга 
+	_timers.orderExpaireIntervalTimer = setInterval(function(){
+		_.each(options.assets, function(x){
+			if (x.trade == 'open')
+			{
+				emitter.emit('MQE_selectExpireOrders', x.code);
+			}	
+		});
+	}, options.orderExpaireInterval);
+
+	//ставим генерацию лучшей котировки 
+	_timers.bestQuotePublishIntervalTimer = setInterval(function(){
+		emitter.emit('MQE_publishAllBestQuote');	
+	}, options.bestQuotePublishInterval);
+
+	
+	sys.log('  ====  All subsystem ON! All timers ON! Ready to Work! ==== ');
+});
 
 //Поступил новый ордер нам 
 emitter.addListener('MQE_newOrder', function(data){
@@ -343,7 +425,7 @@ emitter.addListener('MQE_matchEngine', function(a, sell, buy){
 	//для поддержки ордеров с експайром 
 	var _nowDt = new Date().getTime();
 
-	//не матчим устаревшие котировки, ни будут убраны отдельно  
+	//дополнительная проверка 
 	if (((sell.c != 0) && (sell.c <= _nowDt)) || ((buy.c != 0) && (buy.c <= _nowDt)))
 		return;	
 	
@@ -733,11 +815,12 @@ emitter.addListener('MQE_matchOrder', function(sell, buy){
 	
 });
 
-
 //выборка данных 
 emitter.addListener('MQE_selectTopBook', function(a){
 	if (typeof(a) == 'undefined')	a = 'BTC/USD';
 	
+	//var _book = {'s':null,'b':null};
+//var time1 = process.hrtime();	
 	//получить топ буков: для продажи - минимум цены, для покупки: максимум 
 	async.parallel([
 		function(callBack){
@@ -1073,7 +1156,7 @@ emitter.addListener('MQE_publishAllBestQuote', function(){
 
 
 //===========================================================================================================
-sys.log(' ===== Setting up runtime ======= ');
+//sys.log(' ===== Setting up runtime ======= ');
 //===========================================================================================================
 //new Date().getTime()
 
@@ -1094,6 +1177,7 @@ var test = redis.createClient(options.redisPort, options.redisHost, {
 	});
 
 setInterval(function(){
+	return;
 	sys.log('================== Gen +500 orders ========================');   
 	for (var i = 0; i < 500; i++)
 	{
@@ -1106,36 +1190,7 @@ setInterval(function(){
 
 
 
-setInterval(function(){
-	
-	_.each(options.assets, function(x){
-		if (x.trade == 'open')
-		{
-			emitter.emit('MQE_selectTopBook', x.code);
-		}	
-	});
 
-}, options.orderMatchInterval);
-
-//таймер експайринга 
-
-
-setInterval(function(){
-	
-	_.each(options.assets, function(x){
-		if (x.trade == 'open')
-		{
-			emitter.emit('MQE_selectExpireOrders', x.code);
-		}	
-	});
-
-}, options.orderExpaireInterval);
-
-
-//ставим генерацию лучшей котировки 
-setInterval(function(){
-	emitter.emit('MQE_publishAllBestQuote');	
-}, options.bestQuotePublishInterval);
 
 
 
