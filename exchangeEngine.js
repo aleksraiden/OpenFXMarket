@@ -7,6 +7,7 @@ var sys 	= require('sys'),
 	crypto 	= require('crypto'),
 	redis   = require("./lib/node_redis2/index"),
 	async   = require('./lib/async'),	
+	uuid    = require('./lib/uuid'), //для генерации ид ордеров используем https://github.com/OrangeDog/node-uuid
 	Buffer 	= require('buffer').Buffer;
 	
 var _ = require('./lib/underscore');
@@ -24,52 +25,6 @@ process.addListener('uncaughtException', function (err){
   return true;  
 });
 
-function array_chunk (input, size, preserve_keys) {
-  // http://kevin.vanzonneveld.net
-  // +   original by: Carlos R. L. Rodrigues (http://www.jsfromhell.com)
-  // +   improved by: Brett Zamir (http://brett-zamir.me)
-  // %        note 1: Important note: Per the ECMAScript specification, objects may not always iterate in a predictable order
-  var x, p = '', i = 0, c = -1, l = input.length || 0, n = [];
-
-  if (size < 1) {
-    return null;
-  }
-
-  if (Object.prototype.toString.call(input) === '[object Array]') {
-    if (preserve_keys) {
-      while (i < l) {
-        (x = i % size) ? n[c][i] = input[i] : n[++c] = {}, n[c][i] = input[i];
-        i++;
-      }
-    }
-    else {
-      while (i < l) {
-        (x = i % size) ? n[c][x] = input[i] : n[++c] = [input[i]];
-        i++;
-      }
-    }
-  }
-  else {
-    if (preserve_keys) {
-      for (p in input) {
-        if (input.hasOwnProperty(p)) {
-          (x = i % size) ? n[c][p] = input[p] : n[++c] = {}, n[c][p] = input[p];
-          i++;
-        }
-      }
-    }
-    else {
-      for (p in input) {
-        if (input.hasOwnProperty(p)) {
-          (x = i % size) ? n[c][x] = input[p] : n[++c] = [input[p]];
-          i++;
-        }
-      }
-    }
-  }
-  return n;
-}
-
 sys.puts('\n\n');
 sys.puts(' ====== openFxMarket.com ======');
 sys.puts(' ====== 2013 (c) AGPsource.com ====== ');
@@ -84,7 +39,7 @@ var options = {
 	exchangeId: null, //уникальный ид сервера, генерируется при страрте, если не задан 
 	
 	//RedisDB server 
-	redisPort: 6380,
+	redisPort: 6379,
 	redisHost: 'localhost',
 	redisConfig: {
 		parser: "javascript", //использовать hiredis, если есть возможность собрать и подключить 
@@ -125,6 +80,8 @@ var options = {
 	redisGlobalOrderStatus: 'MQE_GLOBAL_ORDERS_STATUS',
 	//канал для оповещения других нод о своей работе 
 	redisNodeNotificator: 'MQE_NODES_NOTIFY_CHANNEL',
+	//канал для трансляции ид снятых ордеров 
+	redisCanceledOrdersStream: 'MQE_CANCELED_ORDERS_CHANNEL',
 	
 	
 	//в каком формате принимать котировки (пока json, потом возможно более эффективный типа messagepack или protobuf)
@@ -240,8 +197,8 @@ var options = {
 				else
 				if (ch == options.redisControlsStream)
 				{
-					//у нас новая команда 
-					//emitter.emit('MQE_newOrder', _msg);
+					//у нас новая команда управления 
+					emitter.emit('MQE_controlAction', _msg);
 				}			
 			}
 		}catch(e){
@@ -310,7 +267,6 @@ emitter.addListener('MQE_loadStartUpConfig', function(callBack){
 	});	
 });
 
-
 //сигнал, что мы можем начинать работать 
 emitter.addListener('MQE_readyToWork', function(){
 
@@ -342,6 +298,27 @@ emitter.addListener('MQE_readyToWork', function(){
 	
 	sys.log('  ====  All subsystem ON! All timers ON! Ready to Work! ==== ');
 });
+
+//общий обработчик комманд управления 
+emitter.addListener('MQE_controlAction', function(data){
+	//комманда снятия ордера с торговой очереди 
+	if (data.action == 'cancel')
+	{
+		if ((_.isUndefined(data.data.reason)) || (_.isEmpty(data.data.reason)))
+			data.data.reason = 'Canceled by user';
+		
+		sys.log('[COMMAND] ' + data.action + ' has apply for: ' + data.data.orderIds.length + ' orders with reason: ' + data.data.reason);
+		//нам всегда присылают массив ордеров (даже если снимает только один)
+		// а также одна общая причина (строка, которая будет записана в глобальную таблицу статусов)
+		
+		_.each(data.data.orderIds, function(orderId){
+		
+			emitter.emit('MQE_cancelOrder', orderId, data.data.reason);
+		
+		});	
+	}
+});
+
 
 //Поступил новый ордер нам 
 emitter.addListener('MQE_newOrder', function(data){
@@ -883,19 +860,16 @@ emitter.addListener('MQE_selectExpireOrders', function(a){
 	ordbs.zrevrangebyscore([
 					options.redisOrderExpiresSet + a.toUpperCase(),
 					'(' + _now,
-					'(0',
-					'WITHSCORES'  //TODO: здесь можно ускорить, убрав тестовый параметр WITHSCORES
+					'(0'
 					], 
 		function(err, data){
 			if (!err) 
 			{
 				if (data.length > 0)
 				{
-					var _expk = array_chunk(data, 2, false);
-									
-					sys.log('[EXPIRE] To expired: ' + _expk.length + ' orders');
+					sys.log('[EXPIRE] To expired: ' + data.length + ' orders');
 					
-					_.each(_expk, function(el){
+					_.each(data, function(el){
 						emitter.emit('MQE_orderExpire', el[0], a);					
 					});
 				}			
@@ -913,7 +887,7 @@ emitter.addListener('MQE_selectExpireOrders', function(a){
 emitter.addListener('MQE_orderExpire', function(orderId, a){
 	//первым делом получить ордер из общего стора 
 	ordbs.hget(options.redisAllOrdersDB, orderId, function(err, data){
-		if (!err)
+		if ((!err) && (!_.isEmpty(data)))
 		{
 			var order = JSON.parse( data );
 			
@@ -963,6 +937,62 @@ emitter.addListener('MQE_orderExpire', function(orderId, a){
 	});
 });
 
+//снятие ордера 
+// !TODO: можно обьеденить код с Expire - это по сути почти одинаковое действие
+emitter.addListener('MQE_cancelOrder', function(orderId, reason){
+	//первым делом получить ордер из общего стора 
+	ordbs.hget(options.redisAllOrdersDB, orderId, function(err, data){
+		if (!err)
+		{
+			var order = JSON.parse( data );
+			
+			//теперь удаляем из общего сета (вопрос надо ли?, пока оставим options.redisAllOrdersDB
+			async.parallel([
+				//удаление из ордербука 
+				function(callBack){
+					var _orderbook = options.redisOrderbookPrefix + order.a.toUpperCase() + '_' + order.t.toUpperCase();
+					
+					ordbs.zrem(_orderbook, order.__json, function(err, res){
+						if (!err)
+							callBack(null);
+						else
+							callBack(res);
+					});			
+				},
+				//из таблицы с експайрами 
+				function(callBack){
+					ordbs.zrem(options.redisOrderExpiresSet + order.a.toUpperCase(), orderId, function(err, res){
+						if (!err)
+							callBack(null);
+						else
+							callBack(res);
+					});			
+				},
+				//выставить глобал ордер статус 
+				function(callBack){
+					ordbs.hset(options.redisGlobalOrderStatus, orderId, '[CANCELED] ' + reason, function(err, res){
+						if (!err)
+							callBack(null);
+						else
+							callBack(res);
+					});			
+				}], 
+				function(err, responce){
+				
+					if(!err)
+					{
+						//оповещаем внешние сервисы 
+						sys.log('[CANCELED] Order ' + order.t + '  '+order.f[0]+'#' + order._ + ' has canceled by: ' + reason);
+						
+						ordbs.publish(options.redisCanceledOrdersStream, order._, function(err, result){});					
+					}
+			
+			});
+		}	
+	});
+});
+
+
 //генерация фейковой котировки 
 emitter.addListener('MQE_generateTestQuote', function(){
 
@@ -979,13 +1009,10 @@ emitter.addListener('MQE_generateTestQuote', function(){
 		c : 0,
 		f : 'P00000000'
 	};
-	
-	var _t = process.hrtime()[1];
-		//выравниваем по длине 
-		if (_t < 100)
-			_t = _t + 100;
-	
-	q._ = q.d + '' + _t;
+
+	q._ = uuid.v4({rng: uuid.nodeRNG});
+	//теперь id ордера это уникальный UUID (скорее всего v4)
+
 	
 	if (Math.random() > 0.5)
 		q.t = 'b';
@@ -1177,9 +1204,9 @@ var test = redis.createClient(options.redisPort, options.redisHost, {
 	});
 
 setInterval(function(){
-	return;
+	
 	sys.log('================== Gen +500 orders ========================');   
-	for (var i = 0; i < 500; i++)
+	for (var i = 0; i < 100; i++)
 	{
 		emitter.emit('MQE_generateTestQuote');
 	}
