@@ -73,6 +73,8 @@ var options = {
 	redisLastQuoteStream: 'MQE_LAST_QUOTES_CHANNEL',
 	//хеш для истории всех ордеров 
 	redisAllOrdersDB: 'MQE_ORDERS_DB',
+	//для хранения експайров надо отдельный сортед сет (чтобы выбирать одним запросом)
+	redisOrderExpiresSet: 'MQE_EXPIRES_ORDERSTORE',
 	
 	
 	//в каком формате принимать котировки (пока json, потом возможно более эффективный типа messagepack или protobuf)
@@ -86,6 +88,9 @@ var options = {
 	
 	//интервал чека стакана на предмет матчинга (в миллисекундах)
 	orderMatchInterval: 1000,
+	
+	//как часто проверять експайринг (для топ-оф-бук он проверяется при каждом матчинге)
+	orderExpaireInterval: 1000,
 	
 	//сколько может быть паралельных торговых очередей (инструментов)
 	maxAssetsBook: 1000,
@@ -221,7 +226,8 @@ emitter.addListener('MQE_newOrder', function(data){
 	ordbs.hset(options.redisAllOrdersDB, data._, data.__json, function(err, result){
 		if (!err)
 		{		
-		ordbs.zadd([ 
+			// !TODO: может тоже через async делать? надо подумать про архитектуру  
+			ordbs.zadd([ 
 					//вида: MQE_ORDERBOOK_BTC/USD_S (sell) или MQE_ORDERBOOK_BTC/USD_B (buy)
 					options.redisOrderbookPrefix + data.a.toUpperCase() + '_' + data.t.toUpperCase(),
 					data.p,
@@ -245,7 +251,11 @@ emitter.addListener('MQE_newOrder', function(data){
 										__LAST_ORDER__[ data.a.toUpperCase() ] = {S:null,B:null};
 										
 									__LAST_ORDER__[ data.a.toUpperCase() ][ data.t.toUpperCase() ] = data;
-								}								
+								}
+
+								//для заявок по времени добавить их в сет.
+								if (data.с != 0)
+									ordbs.zadd([options.redisOrderExpiresSet + data.a.toUpperCase(), data.с, data._]);								
 							});
 						}
 						else
@@ -784,6 +794,34 @@ emitter.addListener('MQE_selectTopBook', function(a){
 	});
 });
 
+//проверка на експайринг ордеров 
+emitter.addListener('MQE_expireOrders', function(a){
+	//мы выбираем из сета все ордера, которуе уже проекспайрены 
+	var _now = new Date().getTime();
+	
+	//выбрать все, кто равен или меньше текущего 
+	ordbs.zrevrangebyscore([
+					options.redisOrderExpiresSet + a.toUpperCase(),
+					'(' + _now,
+					'(0',
+					'WITHSCORES'], 
+		function(err, data){
+			if ((!err) && (data.length > 0))
+			{
+				sys.log('[EXPIRE] To expired: ' + data.length + ' orders');
+				
+				sys.puts('\n' + eye.inspect( data ) + '\n');
+			
+			}
+			else
+			{
+				sys.puts('\n================\n' + eye.inspect(err) + '\n' + eye.inspect(data) + '\n==================================\n');
+			
+			
+			}
+		}
+	);
+});
 
 //генерация фейковой котировки 
 emitter.addListener('MQE_generateTestQuote', function(){
@@ -1006,6 +1044,8 @@ setInterval(function(){
 
 //emitter.emit('MQE_generateTestQuote');
 
+
+
 setInterval(function(){
 	
 	_.each(options.assets, function(x){
@@ -1016,6 +1056,20 @@ setInterval(function(){
 	});
 
 }, options.orderMatchInterval);
+
+//таймер експайринга 
+
+
+setInterval(function(){
+	
+	_.each(options.assets, function(x){
+		if (x.trade == 'open')
+		{
+			emitter.emit('MQE_expireOrders', x.code);
+		}	
+	});
+
+}, options.orderExpaireInterval);
 
 
 //ставим генерацию лучшей котировки 
