@@ -317,6 +317,60 @@ emitter.addListener('MQE_controlAction', function(data){
 		
 		});	
 	}
+	else
+	if (data.action == 'setMatchInterval')
+	{
+		//разрешенный диапазон: 50 мс... 5000 мс.
+		var newMInterval = parseInt( data.data.newMatchInterval );
+		
+		if ((newMInterval < 50) || (newMInterval > 5000))
+		{
+			sys.log('[ACTION_ERROR] Error while set new match interval. set: ' + newMInterval + ', accept: 50...5000');
+			return;
+		}
+		
+		if (newMInterval != options.orderMatchInterval)
+		{
+			clearInterval( _timers.orderMatchIntervalTimer );
+			
+			_timers.orderMatchIntervalTimer = setInterval(function(){
+				_.each(options.assets, function(x){
+					if (x.trade == 'open')
+					{
+						emitter.emit('MQE_selectTopBook', x.code);
+					}	
+				});
+			}, options.orderMatchInterval);
+			
+			sys.log('[ACTION] Set new matching interval: ' + newMInterval + ' ms.');
+			return;
+		}	
+	}
+	else
+	//интервал генерации ласт/бест котировки 
+	if (data.action == 'setQuoteInterval')
+	{
+		//разрешенный диапазон: 50 мс... 5000 мс.
+		var newQInterval = parseInt( data.data.newQuoteInterval );
+		
+		if ((newQInterval < 200) || (newQInterval > 30000))
+		{
+			sys.log('[ACTION_ERROR] Error while set new quote interval. set: ' + newMInterval + ', accept: 200...30000');
+			return;
+		}
+		
+		if (newQInterval != options.bestQuotePublishInterval)
+		{
+			clearInterval( _timers.bestQuotePublishIntervalTimer );
+			
+			_timers.bestQuotePublishIntervalTimer = setInterval(function(){
+				emitter.emit('MQE_publishAllBestQuote');	
+			}, options.bestQuotePublishInterval);
+			
+			sys.log('[ACTION] Set new matching interval: ' + newMInterval + ' ms.');
+			return;
+		}	
+	}
 });
 
 
