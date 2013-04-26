@@ -7,7 +7,6 @@ var sys 	= require('sys'),
 	crypto 	= require('crypto'),
 	redis   = require("./lib/node_redis2/index"),
 	async   = require('./lib/async'),	
-	uuid    = require('./lib/uuid'), //для генерации ид ордеров используем https://github.com/OrangeDog/node-uuid
 	Buffer 	= require('buffer').Buffer;
 	
 var _ = require('./lib/underscore');
@@ -39,7 +38,7 @@ var options = {
 	exchangeId: null, //уникальный ид сервера, генерируется при страрте, если не задан 
 	
 	//RedisDB server 
-	redisPort: 6379,
+	redisPort: 6380,
 	redisHost: 'localhost',
 	redisConfig: {
 		parser: "javascript", //использовать hiredis, если есть возможность собрать и подключить 
@@ -1046,62 +1045,6 @@ emitter.addListener('MQE_cancelOrder', function(orderId, reason){
 	});
 });
 
-
-//генерация фейковой котировки 
-emitter.addListener('MQE_generateTestQuote', function(){
-
-	//генерируем тестовую котировку 
-	var q = {
-		_ : '', 
-		a : 'BTC/USD',
-		d : new Date().getTime(),
-		t : 's', 
-		p : 0, 
-		v : 1,
-		s : 1,
-		x : 0,
-		c : 0,
-		f : 'P00000000'
-	};
-
-	q._ = uuid.v4({rng: uuid.nodeRNG});
-	//теперь id ордера это уникальный UUID (скорее всего v4)
-
-	
-	if (Math.random() > 0.5)
-		q.t = 'b';
-	
-	q.p = Number(Number( Math.random() ).toFixed(3));   //.replace("'",'');
-	q.v = _.random(1, 1000);
-	q.s = Number( q.p * q.v ); //.toFixed(9).replace("'",'');
-	
-	//для маркет-ордера цена 0 
-	
-	if (Math.random() > 0.9)
-	{
-		q.f = 'M' + q.f;
-		
-		if (q.t == 'b')
-			q.p = 999999999;
-		else
-			q.p = 0;	
-		
-		q.s = 0;
-	}
-	else
-		q.f = 'L' + q.f;
-	
-	//тестируем котировко с лайфтаймом 
-	if (Math.random() > 0.75)
-	{
-		q.c = new Date().getTime() + (_.random(1, 600) * 1000);
-	}
-//sys.puts( eye.inspect( q ) );
-	test.publish( options.redisOrdersStream, JSON.stringify( q )); 
-
-});
-
-
 //генерируем индикативную котировку по Top-of-Book
 emitter.addListener('MQE_generateBestQuote', function(a){
 	
@@ -1239,41 +1182,6 @@ emitter.addListener('MQE_publishAllBestQuote', function(){
 //===========================================================================================================
 //sys.log(' ===== Setting up runtime ======= ');
 //===========================================================================================================
-//new Date().getTime()
-
-
-
-
-//== Test 
-var test = redis.createClient(options.redisPort, options.redisHost, {
-		parser: "javascript"
-	});
-	
-	test.on("error", function (err){
-		sys.log("[ERROR] Test Redis error " + err);
-	});
-	
-	test.on("connect", function (err){
-		sys.log('[OK] Connected to Redis-server at options.redisHost');
-	});
-
-setInterval(function(){
-	
-	sys.log('================== Gen +500 orders ========================');   
-	for (var i = 0; i < 100; i++)
-	{
-		emitter.emit('MQE_generateTestQuote');
-	}
-
-}, 15000);
-
-//emitter.emit('MQE_generateTestQuote');
-
-
-
-
-
-
 
 
 setInterval(function(){
