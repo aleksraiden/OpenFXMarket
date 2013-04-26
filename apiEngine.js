@@ -3,6 +3,8 @@
 var sys 	= require('sys'),
     net		= require('net'),
 	http	= require('http'),
+	url     = require('url'),
+	query   = require('querystring'),
 	events  = require("events"),
 	eye 	= require('./lib/eyes'),
 	crypto 	= require('crypto'),
@@ -34,9 +36,11 @@ sys.puts('\n\n');
 
 // общий обьект настроек сервера
 var options = {
-	host : 'exchange.' + __HOST__,
+	host : 'api.' + __HOST__,
 	
-	exchangeId: null, //уникальный ид сервера, генерируется при страрте, если не задан 
+	httpPort: 9090, //на каком порту у нас HTTP-API
+	socketPort: 9091, //прямой порт для сокет-апи 
+	websocketPort: 8443, //порт для вебсокет апи 
 	
 	//RedisDB server 
 	redisPort: 6380,
@@ -52,6 +56,21 @@ var options = {
 	redisOrdersStream: 'MQE_ORDERS_CHANNEL', 
 	//управляющий канал (команды, отмены и т.п.)
 	redisControlsStream: 'MQE_CONTROLS_CHANNEL',
+	//где лежат данные с авторизациями юзеров 
+	redisUserAccountsAuth: 'MQE_AUTH_ACCOUNTS',
+	//канал для оповещения других нод о своей работе 
+	redisNodeNotificator: 'MQE_NODES_NOTIFY_CHANNEL',
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
 	//это список ордеров, которые сматчили, но они по какой-то причине не дошли до расчета по аккаунтам  
 	redisMatchedOrdersQueue: 'MQE_MATCHED_ORDERS',
 	//префикс для ордербуков (добавляем код инструмента в верхнем регистре)
@@ -78,8 +97,7 @@ var options = {
 	redisOrderExpiresSet: 'MQE_EXPIRES_ORDERSTORE_',
 	//глобальная таблица статусов ордеров (hash table)
 	redisGlobalOrderStatus: 'MQE_GLOBAL_ORDERS_STATUS',
-	//канал для оповещения других нод о своей работе 
-	redisNodeNotificator: 'MQE_NODES_NOTIFY_CHANNEL',
+	
 	//канал для трансляции ид снятых ордеров 
 	redisCanceledOrdersStream: 'MQE_CANCELED_ORDERS_CHANNEL',
 	
@@ -154,6 +172,35 @@ var options = {
 };
 	//последняя котировка 
 	var __LAST_ORDER__ = {};
+	
+	var apiServer = {
+		http: 		null,  //HTTP-API сервер 
+		socket: 	null,  //для soсket-сервера
+		websocket: 	null,
+		redis: 		null,
+		
+		//массив какие методы нам доступны 
+		avalaibleActions: [
+			'/status', //Статус сервера и апи 
+			'/login',
+			'/trade/assets', //инфо про все торговые очереди 
+			'/orderbook/top', //топ ордербука - 1
+			'/orderbook/10', //топ ордербука - 10
+			'/orderbook/25', //топ ордербука - 25
+			'/orderbook/50', //топ ордербука - 50
+			'/orderbook/100', //топ ордербука - 100
+			'/orderbook/full', //полностью ордербук на всю глубину 
+			'/order/last', //последняя котировка
+			'/order/best',
+			'/order/get', //сразу ласт и бест 
+			'/order/add', // добавление новой котировки 
+			'/order/cancel', //снять котировку
+			'/order/status',  //статус котировки
+
+			'account/orders' //все ордера аккаунта
+						
+			]
+	};
 
 	//Глобальный флаг, включает дебаг-режим протокола редиса 
 	redis.debug_mode = false;
@@ -177,7 +224,7 @@ var options = {
 	
 		try 
 		{
-			if (((ch == options.redisOrdersStream) || (ch == options.redisControlsStream)) && (msg.indexOf('{"_":') === 0))
+			if (((ch == options.redisOrdersStream) || (ch == options.redisLastQuoteStream) || (ch == options.redisControlsStream)) && (msg.indexOf('{"_":') === 0))
 			{
 				var _msg = JSON.parse(msg);
 				
@@ -211,13 +258,13 @@ var options = {
 	
 
 	//а теперь клиент для ордербуков 
-	var ordbs = redis.createClient(options.redisPort, options.redisHost, options.redisConfig);
+	var datadbs = redis.createClient(options.redisPort, options.redisHost, options.redisConfig);
 	
-	ordbs.on("error", function (err){
+	datadbs.on("error", function (err){
 		sys.log("[ERROR] Redis error " + err);
 	});
 	
-	ordbs.on("connect", function (err){
+	datadbs.on("connect", function (err){
 		
 		emitter.emit('MQE_loadStartUpConfig', function(){
 			emitter.emit('MQE_readyToWork');
@@ -226,14 +273,13 @@ var options = {
 		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 	});
 	
-	//храним ид таймеров разных 
-	var _timers = {};
+	
 	
 //=================
 //загружает конфигурацию торговых очередей и инструментов, потом вызивает уже стартовый калбек 
 emitter.addListener('MQE_loadStartUpConfig', function(callBack){
 	//для начала достанем конфигурацию
-	ordbs.hgetall(options.redisAssetsTradeConfig, function(err, data){
+	datadbs.hgetall(options.redisAssetsTradeConfig, function(err, data){
 		sys.puts( eye.inspect( data ) ) ;
 		
 		if (_.isEmpty(data))
@@ -249,15 +295,10 @@ emitter.addListener('MQE_loadStartUpConfig', function(callBack){
 			options.assets.push( obj );
 		});		
 		
-		
-		if (options.exchangeId == null)
-		{
-			options.exchangeId = 'ex' + new Date().getTime() + '_' + _.random(1, 9999);
-		}
-			
+					
 		//оповестим всех, что мы работаем 
-		ordbs.publish(options.redisNodeNotificator, JSON.stringify({
-			node: options.exchangeId,
+		datadbs.publish(options.redisNodeNotificator, JSON.stringify({
+			node: 'api',
 			startTs: __STARTUP__,
 			status: 'startup'
 		}));
@@ -269,35 +310,72 @@ emitter.addListener('MQE_loadStartUpConfig', function(callBack){
 
 //сигнал, что мы можем начинать работать 
 emitter.addListener('MQE_readyToWork', function(){
-
-	//таймер матчинга ордеров 
-	_timers.orderMatchIntervalTimer = setInterval(function(){
-		_.each(options.assets, function(x){
-			if (x.trade == 'open')
-			{
-				emitter.emit('MQE_selectTopBook', x.code);
-			}	
-		});
-	}, options.orderMatchInterval);
-
-	//таймер експайринга 
-	_timers.orderExpaireIntervalTimer = setInterval(function(){
-		_.each(options.assets, function(x){
-			if (x.trade == 'open')
-			{
-				emitter.emit('MQE_selectExpireOrders', x.code);
-			}	
-		});
-	}, options.orderExpaireInterval);
-
-	//ставим генерацию лучшей котировки 
-	_timers.bestQuotePublishIntervalTimer = setInterval(function(){
-		emitter.emit('MQE_publishAllBestQuote');	
-	}, options.bestQuotePublishInterval);
+	
+	//создаем HTTP-сервер 
+	apiServer.http = http.createServer(function(req, resp){
+		//принимаем только GET/POST методы 
+		if (req.method == 'GET') || (req.method == 'POST')
+			emitter.emit('MQE_HTTP_REQUEST', req, resp);
+		else
+		{
+			resp.writeHead(403, 'Unsupported HTTP Method');
+			resp.end();		
+		}
+	});
+	
+	//скорее служебный листенер, реально ни для чего не надо ) 
+	apiServer.http.addListener('connection', function(socket){
+		sys.log('[HTTP] New connection established');
+	});
+	
+	//для последующего повышения до вебсокета 
+	apiServer.http.addListener('upgrade', function(req, socket, head){
+		
+	});
+	
+	//биндим для прослушки порта 
+	apiServer.http.listen(options.httpPort, 'localhost', 511, function(){
+		sys.log('[HTTP] OK! HTTP server started and bound to listen their port.');
+	});	
 
 	
-	sys.log('  ====  All subsystem ON! All timers ON! Ready to Work! ==== ');
+	sys.log('  ====  All subsystem ON! Ready to Work! ==== ');
 });
+
+//основной обработчик запросов по HTTP 
+emitter.addListener('MQE_HTTP_REQUEST', function(req, resp){
+	//sys.puts(  sys.inspect(req) );
+	var _url = url.parse(req.url, true);
+	
+	if (_.indexOf(apiServer.avalaibleActions, _url.pathname) == -1)
+	{
+		resp.writeHead(404, 'Unsupported command');
+		resp.end();	
+		
+		return;
+	}
+	
+	
+	//теперь обработка команд 
+	if (_url.pathname == '/order/add')
+	{
+		//добавление одной или нескольких котировок (передаются как JSON)
+		//нам надо распарсить, проверить их, привести к формату, потом сгенерировать ид, отправить их на биржу,
+		//потом дождаться акцепта и вернуть ид-шники 
+		
+		
+	
+	}
+	
+	
+	
+});
+
+
+
+
+
+
 
 //генерируем индикативную котировку по Top-of-Book
 emitter.addListener('MQE_generateBestQuote', function(a){
@@ -436,52 +514,3 @@ emitter.addListener('MQE_publishAllBestQuote', function(){
 //===========================================================================================================
 //sys.log(' ===== Setting up runtime ======= ');
 //===========================================================================================================
-
-
-setInterval(function(){
-	async.parallel([
-					function(callBack){				
-						ordbs.zcount(options.redisOrderbookPrefix + 'BTC/USD_B', '-inf','+inf', function(err, result){
-							if (err)
-								callBack(1, result);
-							else
-								callBack(null, result);
-						});
-					},
-					function(callBack){	
-						ordbs.zcount(options.redisOrderbookPrefix + 'BTC/USD_S', '-inf','+inf', function(err, result){
-							if (err)
-								callBack(1, result);
-							else
-								callBack(null, result);
-						});
-					}],
-					function(err, result){
-						if (!err)
-						{
-							sys.log('==== Orderbook depth =====\n\n\n');
-							sys.log(' SELL: ' + result[1] + ',  BUY: ' + result[0]);
-							sys.log('\n\n');
-							
-							var _lt = _.clone(_lastMatchesTime);
-								_lastMatchesTime = [];
-								
-							var _s = 0;
-							
-							_.each(_lt, function(diff){
-								_s = _s + Math.ceil(diff[0] * 1e9 + diff[1]);
-							});
-							
-							sys.log('[DEBUG] AvG match two order by '+Number((_s/_lt.length)/1000000).toFixed(3)+' ms.');
-							sys.puts('\n\n\n\n\n');						
-						}
-					}
-				);
-		
-
-
-}, 50000);
-
-
-
-
