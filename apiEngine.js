@@ -60,8 +60,10 @@ var options = {
 	redisUserAccountsAuth: 'MQE_AUTH_ACCOUNTS',
 	//канал для оповещения других нод о своей работе 
 	redisNodeNotificator: 'MQE_NODES_NOTIFY_CHANNEL',
-	
-	
+	//канал, куда паблишим ордера, которые удачно добавлены в очереди
+	redisAcceptedOrdersStream: 'MQE_ACCEPTED_ORDERS_CHANNEL',
+	//стрим для публикации последней котировки 
+	redisLastQuoteStream: 'MQE_LAST_QUOTES_CHANNEL',
 	
 	
 	
@@ -77,8 +79,7 @@ var options = {
 	redisOrderbookPrefix: 'MQE_ORDERBOOK_',
 	//название ключа для топовой котировки (хеш со всеми последними котировками (топ-оф-бук)
 	redisCurrentQuoteHash: 'MQE_LAST_QUOTES',
-	//канал, куда паблишим ордера, которые удачно добавлены в очереди
-	redisAcceptedOrdersStream: 'MQE_ACCEPTED_ORDERS_CHANNEL',
+	
 	//канал, куда постим оредра, которые сматчены между собой (команды для изменения аккаунта)
 	redisMatchedOrdersStream: 'MQE_MATCHED_ORDERS_CHANNEL',
 	//это ордера просроченные 
@@ -89,8 +90,7 @@ var options = {
 	redisErroredOrdersStream: 'MQE_ERRORED_ORDERS_CHANNEL',
 	//где храним, по каким инструментам торгуем 
 	redisAssetsTradeConfig: 'MQE_ASSETS_CONFIG',
-	//стрим для публикации последней котировки 
-	redisLastQuoteStream: 'MQE_LAST_QUOTES_CHANNEL',
+	
 	//хеш для истории всех ордеров 
 	redisAllOrdersDB: 'MQE_ORDERS_DB',
 	//для хранения експайров надо отдельный сортед сет (чтобы выбирать одним запросом)
@@ -172,6 +172,7 @@ var options = {
 };
 	//последняя котировка 
 	var __LAST_ORDER__ = {};
+	var __BEST_ORDER__ = {};
 	
 	var apiServer = {
 		http: 		null,  //HTTP-API сервер 
@@ -215,7 +216,7 @@ var options = {
 	pubsub.on("connect", function (err){
 		sys.log('[OK] Connected to Redis-server at ' + options.redisHost);
 		
-		pubsub.subscribe([options.redisOrdersStream, options.redisControlsStream]);
+		pubsub.subscribe([options.redisOrdersStream, options.redisControlsStream, options.redisAcceptedOrdersStream, options.redisLastQuoteStream]);
 	});
 	
 	//слушаем каналы 
@@ -224,15 +225,14 @@ var options = {
 	
 		try 
 		{
-			if (((ch == options.redisOrdersStream) || (ch == options.redisLastQuoteStream) || (ch == options.redisControlsStream)) && (msg.indexOf('{"_":') === 0))
+			if (msg.indexOf('{"_":') === 0)
 			{
 				var _msg = JSON.parse(msg);
 				
 				//сдублируем, чтобы потом не тратиться на перевод в строку 
 				_msg.__json = msg;
-				
-				//TODO: дополнительно проверять формат сообщений 
-				if (typeof(_msg) != 'object') return;
+			}
+
 
 				if (ch == options.redisOrdersStream)
 				{
@@ -246,7 +246,22 @@ var options = {
 				{
 					//у нас новая команда управления 
 					emitter.emit('MQE_controlAction', _msg);
-				}			
+				}
+				else
+				//сюда транслируют последние и лучшие котировки 
+				if (ch == options.redisLastQuoteStream)
+				{
+					if (_msg.type == 'best')
+					{
+						__BEST_ORDER__[ _msg.code ] = _msg;					
+					}
+					else
+					if (_msg.type == 'last')
+					{
+						__LAST_ORDER__[ _msg.code ] = _msg;					
+					}
+				
+				}
 			}
 		}catch(e){
 			sys.puts('\n===============================================\n');
